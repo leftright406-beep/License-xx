@@ -3,99 +3,113 @@ import sqlite3
 import secrets
 import time
 import os
+import traceback
 from datetime import datetime
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 
-# 🔑 كلمة سر لوحة التحكم — غيّرها لشيء تعرفه
-ADMIN_PASSWORD = "MySecretPass2026"
+ADMIN_PASSWORD = "MySecretPass2026" # كلمة السر الخاصة بك
 
-DB_PATH = "licenses.db"
+# استخدام مسار مؤقت مضمون على Render
+DB_PATH = "/tmp/licenses.db"
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS licenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key TEXT UNIQUE NOT NULL,
-            days INTEGER NOT NULL,
-            note TEXT DEFAULT '',
-            created_at REAL NOT NULL,
-            expire_at REAL NOT NULL,
-            used_count INTEGER DEFAULT 0,
-            max_uses INTEGER DEFAULT 1,
-            banned INTEGER DEFAULT 0
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key TEXT,
-            serial TEXT,
-            game TEXT,
-            ip TEXT,
-            result TEXT,
-            timestamp REAL
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS licenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE NOT NULL,
+                days INTEGER NOT NULL,
+                note TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                expire_at REAL NOT NULL,
+                used_count INTEGER DEFAULT 0,
+                max_uses INTEGER DEFAULT 1,
+                banned INTEGER DEFAULT 0
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT,
+                serial TEXT,
+                game TEXT,
+                ip TEXT,
+                result TEXT,
+                timestamp REAL
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB INIT ERROR: {e}")
+
+# تهيئة قاعدة البيانات فوراً عند التشغيل
+init_db()
 
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-# ============ API للعبة ============
+@app.errorhandler(500)
+def internal_error(error):
+    error_msg = traceback.format_exc()
+    return f"<h1>حدث خطأ داخلي</h1><pre>{error_msg}</pre>", 500
+
 @app.route("/connect", methods=["POST"])
 @app.route("/api/verify", methods=["POST"])
 def verify():
-    game = request.form.get("game", "pubg")
-    user_key = (request.form.get("user_key", "") or "").strip().upper()
-    serial = request.form.get("serial", "")
-    ip = request.remote_addr or "unknown"
+    try:
+        game = request.form.get("game", "pubg")
+        user_key = (request.form.get("user_key", "") or "").strip().upper()
+        serial = request.form.get("serial", "")
+        ip = request.remote_addr or "unknown"
 
-    if not user_key:
-        log_attempt(user_key, serial, game, ip, "empty_key")
-        return jsonify({"status": False, "message": "Missing key"}), 400
+        if not user_key:
+            log_attempt(user_key, serial, game, ip, "empty_key")
+            return jsonify({"status": False, "message": "Missing key"}), 400
 
-    conn = db()
-    row = conn.execute("SELECT * FROM licenses WHERE key = ?", (user_key,)).fetchone()
+        conn = db()
+        row = conn.execute("SELECT * FROM licenses WHERE key = ?", (user_key,)).fetchone()
 
-    if not row:
-        log_attempt(user_key, serial, game, ip, "not_found")
+        if not row:
+            log_attempt(user_key, serial, game, ip, "not_found")
+            conn.close()
+            return jsonify({"status": False, "message": "Invalid key"})
+
+        if row["banned"] == 1:
+            log_attempt(user_key, serial, game, ip, "banned")
+            conn.close()
+            return jsonify({"status": False, "message": "Key banned"})
+
+        if row["expire_at"] < time.time():
+            log_attempt(user_key, serial, game, ip, "expired")
+            conn.close()
+            return jsonify({"status": False, "message": "Key expired"})
+
+        if row["used_count"] >= row["max_uses"]:
+            log_attempt(user_key, serial, game, ip, "max_uses")
+            conn.close()
+            return jsonify({"status": False, "message": "Max uses reached"})
+
+        conn.execute("UPDATE licenses SET used_count = used_count + 1 WHERE key = ?", (user_key,))
+        conn.commit()
+        log_attempt(user_key, serial, game, ip, "success")
         conn.close()
-        return jsonify({"status": False, "message": "Invalid key"})
 
-    if row["banned"] == 1:
-        log_attempt(user_key, serial, game, ip, "banned")
-        conn.close()
-        return jsonify({"status": False, "message": "Key banned"})
-
-    if row["expire_at"] < time.time():
-        log_attempt(user_key, serial, game, ip, "expired")
-        conn.close()
-        return jsonify({"status": False, "message": "Key expired"})
-
-    if row["used_count"] >= row["max_uses"]:
-        log_attempt(user_key, serial, game, ip, "max_uses")
-        conn.close()
-        return jsonify({"status": False, "message": "Max uses reached"})
-
-    conn.execute("UPDATE licenses SET used_count = used_count + 1 WHERE key = ?", (user_key,))
-    conn.commit()
-    log_attempt(user_key, serial, game, ip, "success")
-    conn.close()
-
-    days_left = int((row["expire_at"] - time.time()) / 86400)
-    return jsonify({
-        "status": True,
-        "message": "OK",
-        "days_left": days_left,
-        "expire_at": row["expire_at"],
-    })
+        days_left = int((row["expire_at"] - time.time()) / 86400)
+        return jsonify({
+            "status": True,
+            "message": "OK",
+            "days_left": days_left,
+            "expire_at": row["expire_at"],
+        })
+    except Exception as e:
+        return jsonify({"status": False, "message": f"Server error: {str(e)}"}), 500
 
 def log_attempt(key, serial, game, ip, result):
     try:
@@ -106,7 +120,7 @@ def log_attempt(key, serial, game, ip, result):
         )
         conn.commit()
         conn.close()
-    except:
+    except Exception:
         pass
 
 def generate_key(prefix="MW"):
@@ -115,7 +129,6 @@ def generate_key(prefix="MW"):
         parts.append(secrets.token_hex(2).upper())
     return "-".join(parts)
 
-# ============ لوحة التحكم ============
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html dir="rtl" lang="ar">
@@ -234,54 +247,57 @@ def admin():
             </body>
         """)
 
-    conn = db()
-    rows = conn.execute("SELECT * FROM licenses ORDER BY id DESC").fetchall()
-    logs_rows = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 50").fetchall()
-    conn.close()
+    try:
+        conn = db()
+        rows = conn.execute("SELECT * FROM licenses ORDER BY id DESC").fetchall()
+        logs_rows = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 50").fetchall()
+        conn.close()
 
-    now = time.time()
-    licenses = []
-    for r in rows:
-        d = dict(r)
-        d["expire_str"] = datetime.fromtimestamp(r["expire_at"]).strftime("%Y-%m-%d %H:%M")
-        d["is_active"] = r["expire_at"] > now and r["banned"] == 0
-        licenses.append(d)
+        now = time.time()
+        licenses = []
+        for r in rows:
+            d = dict(r)
+            d["expire_str"] = datetime.fromtimestamp(r["expire_at"]).strftime("%Y-%m-%d %H:%M")
+            d["is_active"] = r["expire_at"] > now and r["banned"] == 0
+            licenses.append(d)
 
-    logs = []
-    for l in logs_rows:
-        logs.append({
-            "key": l["key"] or "",
-            "serial": l["serial"] or "",
-            "ip": l["ip"] or "",
-            "result": l["result"] or "",
-            "time_str": datetime.fromtimestamp(l["timestamp"]).strftime("%m-%d %H:%M") if l["timestamp"] else "",
-        })
+        logs = []
+        for l in logs_rows:
+            logs.append({
+                "key": l["key"] or "",
+                "serial": l["serial"] or "",
+                "ip": l["ip"] or "",
+                "result": l["result"] or "",
+                "time_str": datetime.fromtimestamp(l["timestamp"]).strftime("%m-%d %H:%M") if l["timestamp"] else "",
+            })
 
-    return render_template_string(ADMIN_HTML, licenses=licenses, logs=logs)
+        return render_template_string(ADMIN_HTML, licenses=licenses, logs=logs)
+    except Exception as e:
+        return f"<h1>خطأ في قاعدة البيانات</h1><pre>{traceback.format_exc()}</pre>"
 
 @app.route("/admin/generate", methods=["POST"])
 def admin_generate():
     if not session.get("admin"):
         return redirect("/admin")
-    prefix = request.form.get("prefix", "MW").upper().strip()
-    days = int(request.form.get("days", 30))
-    note = request.form.get("note", "")
-    max_uses = int(request.form.get("max_uses", 1))
-
-    key = generate_key(prefix)
-    now = time.time()
-    expire_at = now + days * 86400
-
-    conn = db()
     try:
+        prefix = request.form.get("prefix", "MW").upper().strip()
+        days = int(request.form.get("days", 30))
+        note = request.form.get("note", "")
+        max_uses = int(request.form.get("max_uses", 1))
+
+        key = generate_key(prefix)
+        now = time.time()
+        expire_at = now + days * 86400
+
+        conn = db()
         conn.execute(
             "INSERT INTO licenses (key, days, note, created_at, expire_at, max_uses) VALUES (?,?,?,?,?,?)",
             (key, days, note, now, expire_at, max_uses)
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+        conn.close()
+    except Exception:
         pass
-    conn.close()
     return redirect("/admin")
 
 @app.route("/admin/delete", methods=["POST"])
@@ -317,6 +333,5 @@ def home():
     """
 
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
